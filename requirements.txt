@@ -1,0 +1,5 @@
+flake8
+pytest
+pyhipp>=0.3.5
+pyhipp-sims
+elucid

@@ -1,0 +1,193 @@
+# process_data.py
+#
+# A universal script to process merger trees from cosmological simulations 
+# like TNG and Quijote, following ytree best practices. It calculates halo 
+# formation times (a50) using an AnalysisPipeline and saves a filtered 
+# text catalog.
+#
+# Usage:
+# mpirun -np 4 python process_data.py --sim_type tng --base_path /path/to/TNG100-1-Dark/ --min_log_mass 13.5
+# python process_data.py --sim_type quijote --base_path /path/to/quijote_sim/
+
+import ytree
+import numpy as np
+from pathlib import Path
+import argparse
+from tqdm import tqdm
+import yt # ytree's parallelism is built on yt's
+
+# --- Simulation Configuration Dictionary ---
+# Maps universal field names to simulation-specific names and handles unit conversions.
+SIMULATION_CONFIGS = {
+    'quijote': {
+        'hlist_path_template': '{base_path}/hlists/hlist_1.00000.list',
+        'field_map': {
+            'mass': 'Mvir', 'pid': 'pid',
+            'position': 'position', 'velocity': 'velocity',
+        },
+        'unit_conversion': {
+            'mass': 1.0,         # Msun/h
+            'position': 1.0,     # Mpc/h
+            'velocity': 1.0,     # km/s
+        },
+        'is_central_condition': lambda node: node['pid'] == -1,
+        'hubble_constant': 0.6711 # Quijote fiducial h
+    },
+    'tng': {
+        'hlist_path_template': '{base_path}/postprocessing/trees/SubLink/tree_extended.0.hdf5',
+        'field_map': {
+            'mass': 'Group_M_Crit200',
+            'position': 'GroupPos',
+            'velocity': 'GroupVel',
+        },
+        'unit_conversion': {
+            'mass': 1e10,        # 10^10 Msun/h -> Msun/h
+            'position': 1e-3,    # ckpc/h -> Mpc/h
+            'velocity': 1.0,     # km/s (peculiar)
+        },
+        # A central subhalo is the first subhalo in its FoF group.
+        # We process the trees of z=0 FoF groups, identified by their central subhalo.
+        'is_central_condition': lambda node: node['subfind_id'] == node['fof_tree']['GroupFirstSub'][node['snap_num']],
+        'hubble_constant': 0.6774 # TNG fiducial h
+    }
+}
+
+# --- Core Analysis Functions for AnalysisPipeline ---
+
+def get_analysis_functions(config, min_mass_h, max_mass_h):
+    """ Creates filter and analysis functions based on the simulation config. """
+    mass_field = config['field_map']['mass']
+    
+    def halo_filter(node):
+        """ Filter for central halos at z=0 within the mass range. """
+        if node['scale_factor'] != 1.0 or not config['is_central_condition'](node):
+            return False
+        
+        mass_val = node[mass_field].value
+        return (mass_val >= min_mass_h) and (mass_val < max_mass_h)
+
+    def calc_a50(node):
+        """ Calculate formation scale factor. Attaches result to node['a50']. """
+        try:
+            prog_mass = node["prog", mass_field]
+            prog_scale = node["prog", "scale_factor"]
+            
+            if len(prog_mass) < 2:
+                node["a50"] = -1.0; return
+        except (KeyError, IndexError):
+            node["a50"] = -1.0; return
+
+        target_mass = 0.5 * node[mass_field]
+        is_below_half = prog_mass <= target_mass
+
+        if not is_below_half.any():
+            node["a50"] = prog_scale[-1]
+        else:
+            i = np.where(is_below_half)[0][0]
+            if i == 0:
+                node["a50"] = prog_scale[i].value
+            else:
+                mass_high, scale_high = prog_mass[i-1], prog_scale[i-1]
+                mass_low, scale_low = prog_mass[i], prog_scale[i]
+                
+                if (mass_high - mass_low).value > 1e-9:
+                    slope = (scale_high - scale_low) / (mass_high - mass_low)
+                    node["a50"] = (slope * (target_mass - mass_low) + scale_low).value
+                else:
+                    node["a50"] = ((scale_high + scale_low) / 2.0).value
+    
+    return halo_filter, calc_a50
+
+def main():
+    parser = argparse.ArgumentParser(description="Process halo merger trees from cosmological simulations.")
+    parser.add_argument('--sim_type', type=str, required=True, choices=['quijote', 'tng'], help="Type of simulation.")
+    parser.add_argument('--base_path', type=str, required=True, help="Base path to the simulation data directory.")
+    parser.add_argument('--min_log_mass', type=float, default=10.5, help="Minimum halo mass in log10(Msun).")
+    parser.add_argument('--max_log_mass', type=float, default=11, help="Maximum halo mass in log10(Msun).")
+    parser.add_argument('--output_dir', type=str, default='./halo_sample/', help="Directory to save the output file.")
+    
+    args = parser.parse_args()
+    
+    # 1. Enable Parallelism and Select Configuration
+    yt.enable_parallelism()
+    if args.sim_type not in SIMULATION_CONFIGS:
+        raise ValueError(f"Simulation type '{args.sim_type}' not configured.")
+    config = SIMULATION_CONFIGS[args.sim_type]
+    
+    # 2. Load Arbor
+    hlist_path = Path(config['hlist_path_template'].format(base_path=args.base_path))
+    if not hlist_path.exists():
+        if yt.is_root(): print(f"Error: Cannot find tree file: {hlist_path}"); return
+    
+    if yt.is_root(): print(f"Loading arbor from: {hlist_path}")
+    a = ytree.load(str(hlist_path))
+    h = config['hubble_constant']
+
+    # 3. Setup Analysis Pipeline
+    # Convert mass range from log(M/Msun) to simulation units (Msun/h)
+    min_mass_h = (10**args.min_log_mass) * h / config['unit_conversion']['mass']
+    max_mass_h = (10**args.max_log_mass) * h / config['unit_conversion']['mass']
+    
+    # Add an "analysis field" to store results. This is the correct ytree paradigm.
+    a.add_analysis_field("a50", default=-1.0, units="", dtype=np.float64)
+    
+    halo_filter, calc_a50 = get_analysis_functions(config, min_mass_h, max_mass_h)
+    
+    ap = ytree.AnalysisPipeline()
+    ap.add_operation(halo_filter)
+    ap.add_operation(calc_a50)
+    
+    # 4. Run Pipeline in Parallel
+    # We iterate over the roots of each tree (z=0 halos).
+    # The AnalysisPipeline is applied to each root node.
+    trees = list(a.tree_roots)
+    if yt.is_root(): print(f"Processing {len(trees)} trees in parallel...")
+    
+    for tree_root in ytree.parallel_trees(trees):
+        ap.process_target(tree_root)
+        
+    if not yt.is_root(): return # Only the root process handles saving
+
+    # 5. Collect Final Halos and Save to Text File
+    # After the parallel run, 'a50' is populated for halos that passed the filter.
+    # We now select these halos for output.
+    final_halos = list(a.select_halos("(tree['a50'] > 0)"))
+    
+    if not final_halos:
+        print("\nError: No valid halos found after processing. Check mass range or tree data.")
+        return
+        
+    print(f"\nSuccessfully selected {len(final_halos)} valid halos for the final catalog.")
+    
+    fm = config['field_map']
+    uc = config['unit_conversion']
+    
+    output_data = []
+    for node in tqdm(final_halos, desc="Formatting output"):
+        mass_out = node[fm['mass']].to('Msun').value
+        zf_out = 1.0 / node['a50'] - 1.0
+        
+        # .to_ndarray() is a safe way to get numpy array from unyt object
+        pos = (node[fm['position']] * uc['position']).to_ndarray()
+        vel = (node[fm['velocity']] * uc['velocity']).to_ndarray()
+        
+        output_data.append([
+            mass_out, zf_out,
+            pos[0], pos[1], pos[2],
+            vel[0], vel[1], vel[2]
+        ])
+
+    output_array = np.array(output_data)
+    
+    header = ("# Columns:\n# 1. mass [Msun]\n# 2. zf\n# 3. x [Mpc/h]\n# 4. y [Mpc/h]\n"
+              "# 5. z [Mpc/h]\n# 6. vx [km/s]\n# 7. vy [km/s]\n# 8. vz [km/s]")
+    
+    output_file = Path(args.output_dir) / f'halo_sample_{args.sim_type}.txt'
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(output_file, output_array, fmt='%.6e', delimiter=' ', header=header, comments='')
+    
+    print(f"\nSaved final halo catalog to: {output_file}")
+    print("Script finished successfully!")
+
+if __name__ == "__main__":
+    main()
