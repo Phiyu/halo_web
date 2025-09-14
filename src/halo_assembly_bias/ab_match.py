@@ -2,7 +2,7 @@ from . import halo
 import numpy as np
 from pathlib import Path
 
-def ab_match(halo: halo.HaloSample, numbers: np.ndarray) -> list[halo.HaloSample]:
+def ab_matching(halo: halo.HaloSample, numbers: np.ndarray) -> list[halo.HaloSample]:
     '''
     Match halos to galaxies by their indices. Return a dictionary of matched
     halo attributes.

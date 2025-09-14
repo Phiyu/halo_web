@@ -17,7 +17,7 @@ MAX_MASS = 10**14
 # --- File Paths ---
 HLIST_PATH = Path('./hlists/hlist_1.00000.list')
 OUTPUT_DIR = Path('./halo_sample/')
-OUTPUT_FILE = OUTPUT_DIR / 'halo.txt'
+OUTPUT_FILE = OUTPUT_DIR / 'halo_Quijote.txt'
 
 # --- Analysis and Filter Functions (for AnalysisPipeline) ---
 
