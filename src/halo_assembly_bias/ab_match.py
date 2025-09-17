@@ -1,4 +1,4 @@
-from . import halo
+from .samples import halo
 import numpy as np
 from pathlib import Path
 
