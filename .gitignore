@@ -27,7 +27,6 @@ var/
 *.png
 *.dat
 test/
-docs/
 
 # macOS
 .DS_Store
