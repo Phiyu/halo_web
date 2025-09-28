@@ -50,7 +50,8 @@ class TidalField(abc.HasLog):
                 recon_mask = None
             mesh = Mesh.new(n_grids, l_box)
             lams = np.array(lams, dtype=np.float32)
-        return cls(lams, delta, mesh, recon_mask=recon_mask, **init_kw)
+            lam_off = f.datasets['lambda_th']
+        return cls(lams, delta, mesh, recon_mask=recon_mask, lam_off=lam_off, **init_kw)
 
     @cached_property
     def xs_grids(self):
